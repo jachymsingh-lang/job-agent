@@ -20,6 +20,8 @@ jobs:
 
       - run: python job_agent.py
         env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
           ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '19' || '' }}
