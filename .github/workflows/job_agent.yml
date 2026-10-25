@@ -2,8 +2,9 @@ name: Job Agent
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # každý den v 6:00 UTC (7:00 nebo 8:00 praha)
-  workflow_dispatch:       # umožní spustit ručně tlačítkem
+    - cron: "5 17 * * *"   # 19:05 v létě (CEST)
+    - cron: "5 18 * * *"   # 19:05 v zimě (CET)
+  workflow_dispatch:
 
 jobs:
   run:
@@ -22,3 +23,4 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '19' || '' }}
