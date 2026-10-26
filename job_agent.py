@@ -18,7 +18,7 @@ import requests
 # ----------------------------- KONFIGURACE -----------------------------
 
 FEEDS = [
-    # "https://www.startupjobs.cz/nabidky.rss",  # Původní RSS (často 404, hlavní síla je v Gmail alertech)
+    # "https://www.startupjobs.cz/nabidky.rss",
 ]
 
 # Nabídky starší než tento počet dní se přeskočí (pokud feed uvádí datum).
@@ -38,7 +38,7 @@ CONTRACT_KEYWORDS = [
     "part-time", "brigáda", "částečný",
 ]
 
-# Krátká klíčová slova se hledají jako celá slova (aby "it" nesedlo na "city").
+# Krátká klíčová slova se hledají jako celá slova (aby "it" nesedло na "city").
 WHOLE_WORD = {"it", "dpp", "dpč", "ico", "ičo"}
 
 # Nabídky s těmito výrazy se vždy vyřadí (regulární výrazy, malá písmena).
@@ -63,8 +63,8 @@ ADMIN_WORDS = ["administrativ", "asistent", "kancelář", "zadávání dat", "fa
 
 # E-mailové alerty z Prace.cz / Jobs.cz (čtou se z Gmailu přes IMAP).
 ALERT_SENDERS = ["prace.cz", "jobs.cz", "almacareer"]
-ALERT_DAYS = 2          # Zvýšeno na 2 dny zpět, ať ti neutečou nabídky z víkendu
-MAX_ALERT_ITEMS = 60    # Zvýšen limit pro větší zásobu nabídek z Jobs.cz
+ALERT_DAYS = 2          # Kolik dní zpět se alerty čtou
+MAX_ALERT_ITEMS = 60    # Pojistka proti záplavě
 
 # Odkazy v alertech, které nejsou nabídky (patička, odhlášení, sociální sítě...).
 SKIP_LINK_WORDS = [
@@ -157,14 +157,12 @@ def filter_jobs(items: list) -> list:
         if not it["link"] or it["link"] in seen:
             continue
         trusted = bool(it.get("trusted"))
-        # U alertů se hodnotí jen název (popis je společný předmět e-mailu).
         text = it["title"] if trusted else f'{it["title"]} {it["description"]}'
 
         if is_excluded(text):
             continue
 
         if trusted:
-            # Nabídky z alertů už prošly hledáním na portálu, klíčová slova se nekontrolují.
             roles, contracts = [], []
         else:
             roles = find_keywords(text, ROLE_KEYWORDS)
@@ -182,7 +180,6 @@ def filter_jobs(items: list) -> list:
         it["tags"] = list(dict.fromkeys(roles + contracts + priority))
         result.append(it)
 
-    # Doporučené (víc shod s tím, co hledáš) nahoru; při shodě zůstává pořadí z feedu.
     result.sort(key=lambda j: -len(j["priority"]))
     return result
 
@@ -230,7 +227,6 @@ def extract_links(body: str, is_html: bool) -> list:
 
 
 def find_all_mail_folder(imap) -> str:
-    """Najde složku Gmailu "Všechny zprávy" (název se liší podle jazyka účtu)."""
     try:
         status, folders = imap.list()
         for raw in folders or []:
@@ -363,7 +359,7 @@ def build_reply(job: dict) -> str:
     )
 
 
-# ----------------------------- HTML E-MAIL (MODERNÍ DESIGN) -----------------------------
+# ----------------------------- HTML E-MAIL (ŠIRŠÍ A RESPONSIVNÍ DESIGN) -----------------------------
 
 
 def build_html(jobs: list) -> str:
@@ -391,7 +387,7 @@ def build_html(jobs: list) -> str:
         cards.append(f"""
         <tr><td style="padding:0 0 16px 0;">
           <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;border-left:5px solid {border_color};box-shadow:0 1px 3px rgba(0,0,0,0.05);">
-            <tr><td style="padding:20px;">
+            <tr><td style="padding:22px;">
               {star}
               <h2 style="margin:0 0 6px 0;font-size:18px;color:#0f172a;font-weight:700;">{e(job['title'])}</h2>
               {date_line}
@@ -412,10 +408,10 @@ def build_html(jobs: list) -> str:
     return f"""<!DOCTYPE html>
 <html lang="cs"><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 12px;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:20px 8px;">
     <tr><td align="center">
-      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;">
-        <tr><td style="background:#0f172a;border-radius:14px 14px 0 0;padding:22px 24px;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:780px;width:100%;">
+        <tr><td style="background:#0f172a;border-radius:14px 14px 0 0;padding:24px;">
           <div style="font-size:24px;font-weight:800;color:#ffffff;">Job Agent</div>
           <div style="font-size:14px;color:#94a3b8;margin-top:4px;">
             Nalezeno nabídek: {len(jobs)} · doporučených: {top_count} · {datetime.now().strftime('%d. %m. %Y')}
