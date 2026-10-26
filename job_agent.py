@@ -18,7 +18,7 @@ import requests
 # ----------------------------- KONFIGURACE -----------------------------
 
 FEEDS = [
-    "https://www.startupjobs.cz/nabidky.rss",
+    # "https://www.startupjobs.cz/nabidky.rss",  # Původní RSS (často 404, hlavní síla je v Gmail alertech)
 ]
 
 # Nabídky starší než tento počet dní se přeskočí (pokud feed uvádí datum).
@@ -62,10 +62,9 @@ MARKETING_WORDS = ["marketing", "copywrit", "obsah", "social media", "sociální
 ADMIN_WORDS = ["administrativ", "asistent", "kancelář", "zadávání dat", "fakturac", "účetn"]
 
 # E-mailové alerty z Prace.cz / Jobs.cz (čtou se z Gmailu přes IMAP).
-# Odesílatelé se hledají v Gmailu jako from:(...). Případně sem dopiš další doménu.
 ALERT_SENDERS = ["prace.cz", "jobs.cz", "almacareer"]
-ALERT_DAYS = 1          # kolik dní zpět se alerty čtou (1 = posledních 24 hodin)
-MAX_ALERT_ITEMS = 40    # pojistka proti záplavě nesmyslných odkazů
+ALERT_DAYS = 2          # Zvýšeno na 2 dny zpět, ať ti neutečou nabídky z víkendu
+MAX_ALERT_ITEMS = 60    # Zvýšen limit pro větší zásobu nabídek z Jobs.cz
 
 # Odkazy v alertech, které nejsou nabídky (patička, odhlášení, sociální sítě...).
 SKIP_LINK_WORDS = [
@@ -254,8 +253,6 @@ def fetch_alerts() -> list:
     try:
         with imaplib.IMAP4_SSL("imap.gmail.com") as imap:
             imap.login(sender, password)
-            # Čte se složka "Všechny zprávy", aby agent našel alerty i když je filtr Gmailu
-            # přesune z doručené pošty (archivuje) nebo označí jako přečtené.
             folder = find_all_mail_folder(imap)
             status, _ = imap.select(f'"{folder}"', readonly=True)
             if status != "OK":
@@ -366,7 +363,7 @@ def build_reply(job: dict) -> str:
     )
 
 
-# ----------------------------- HTML E-MAIL -----------------------------
+# ----------------------------- HTML E-MAIL (MODERNÍ DESIGN) -----------------------------
 
 
 def build_html(jobs: list) -> str:
@@ -378,44 +375,60 @@ def build_html(jobs: list) -> str:
             desc = desc[:400].rsplit(" ", 1)[0] + "…"
         tags = "".join(
             f'<span style="display:inline-block;background:#eef2ff;color:#3730a3;'
-            f'border-radius:12px;padding:2px 10px;margin:2px 4px 2px 0;font-size:12px;">{e(t)}</span>'
+            f'border-radius:12px;padding:3px 10px;margin:2px 4px 2px 0;font-size:12px;font-weight:500;">{e(t)}</span>'
             for t in job["tags"]
         )
         date_line = (
-            f'<div style="color:#6b7280;font-size:12px;margin-bottom:8px;">{e(job["pubdate"])}</div>'
+            f'<div style="color:#64748b;font-size:12px;margin-bottom:8px;">{e(job["pubdate"])}</div>'
             if job["pubdate"] else ""
         )
         star = (
             '<div style="display:inline-block;background:#fef3c7;color:#92400e;border-radius:6px;'
-            'padding:2px 8px;font-size:12px;font-weight:bold;margin-bottom:8px;">⭐ Doporučeno</div><br>'
+            'padding:3px 8px;font-size:12px;font-weight:bold;margin-bottom:8px;">⭐ Doporučeno</div><br>'
             if job["priority"] else ""
         )
+        border_color = "#f59e0b" if job["priority"] else "#2563eb"
         cards.append(f"""
-        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:18px;margin-bottom:20px;">
-          {star}<h2 style="margin:0 0 6px 0;font-size:18px;color:#111827;">{e(job['title'])}</h2>
-          {date_line}
-          <div style="margin-bottom:10px;">{tags}</div>
-          <p style="margin:0 0 12px 0;color:#374151;font-size:14px;line-height:1.5;">{e(desc)}</p>
-          <a href="{e(job['link'])}" style="display:inline-block;background:#2563eb;color:#ffffff;
-             text-decoration:none;padding:8px 16px;border-radius:6px;font-size:14px;">Otevřít inzerát</a>
-          <div style="margin-top:16px;background:#ecfdf5;border:1px solid #6ee7b7;border-radius:8px;padding:14px;">
-            <div style="font-weight:bold;color:#065f46;margin-bottom:8px;font-size:13px;">
-              Připravený text k zkopírování
-            </div>
-            <div style="white-space:pre-wrap;color:#064e3b;font-size:14px;line-height:1.5;">{e(build_reply(job))}</div>
-          </div>
-        </div>""")
+        <tr><td style="padding:0 0 16px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;border-left:5px solid {border_color};box-shadow:0 1px 3px rgba(0,0,0,0.05);">
+            <tr><td style="padding:20px;">
+              {star}
+              <h2 style="margin:0 0 6px 0;font-size:18px;color:#0f172a;font-weight:700;">{e(job['title'])}</h2>
+              {date_line}
+              <div style="margin-bottom:12px;">{tags}</div>
+              <p style="margin:0 0 16px 0;color:#334155;font-size:14px;line-height:1.6;">{e(desc)}</p>
+              <a href="{e(job['link'])}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:8px;font-size:14px;font-weight:600;">Otevřít inzerát</a>
+              <div style="margin-top:16px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:14px;">
+                <div style="font-weight:bold;color:#065f46;margin-bottom:8px;font-size:13px;">
+                  Připravený text k zkopírování
+                </div>
+                <div style="white-space:pre-wrap;color:#064e3b;font-size:13px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;">{e(build_reply(job))}</div>
+              </div>
+            </td></tr>
+          </table>
+        </td></tr>""")
 
+    top_count = sum(1 for j in jobs if j['priority'])
     return f"""<!DOCTYPE html>
 <html lang="cs"><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">
-  <div style="max-width:680px;margin:0 auto;padding:24px;">
-    <h1 style="color:#111827;font-size:22px;margin:0 0 4px 0;">Job Agent</h1>
-    <p style="color:#6b7280;margin:0 0 24px 0;font-size:14px;">
-      Nalezeno nabídek: {len(jobs)} · doporučených: {sum(1 for j in jobs if j['priority'])} · {datetime.now().strftime('%d. %m. %Y')}
-    </p>
-    {''.join(cards)}
-  </div>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 12px;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;">
+        <tr><td style="background:#0f172a;border-radius:14px 14px 0 0;padding:22px 24px;">
+          <div style="font-size:24px;font-weight:800;color:#ffffff;">Job Agent</div>
+          <div style="font-size:14px;color:#94a3b8;margin-top:4px;">
+            Nalezeno nabídek: {len(jobs)} · doporučených: {top_count} · {datetime.now().strftime('%d. %m. %Y')}
+          </div>
+        </td></tr>
+        <tr><td style="background:#e2e8f0;padding:16px;border-radius:0 0 14px 14px;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            {''.join(cards)}
+          </table>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
 </body></html>"""
 
 
@@ -442,7 +455,6 @@ def send_email(subject: str, html_body: str) -> None:
 
 
 def main() -> int:
-    # Naplánovaný běh se spouští 2x denně (kvůli letnímu/zimnímu času); odešle se jen ten v 19:xx pražského času.
     only_hour = os.environ.get("ONLY_AT_HOUR")
     if only_hour and datetime.now(ZoneInfo("Europe/Prague")).hour != int(only_hour):
         print("Mimo cílovou hodinu (pražský čas), končím.")
