@@ -3,14 +3,18 @@
 
 import html
 import imaplib
+import json
 import os
 import re
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -38,7 +42,7 @@ CONTRACT_KEYWORDS = [
     "part-time", "brigáda", "částečný",
 ]
 
-# Krátká klíčová slova se hledají jako celá slova (aby "it" nesedло na "city").
+# Krátká klíčová slova se hledají jako celá slova (aby "it" nesedělo na "city").
 WHOLE_WORD = {"it", "dpp", "dpč", "ico", "ičo"}
 
 # Nabídky s těmito výrazy se vždy vyřadí (regulární výrazy, malá písmena).
@@ -60,6 +64,29 @@ WEB_WORDS = ["web", "wordpress", "e-shop", "eshop", "webmaster", "administrator"
              "správce", "it", "helpdesk"]
 MARKETING_WORDS = ["marketing", "copywrit", "obsah", "social media", "sociální sítě", "newsletter"]
 ADMIN_WORDS = ["administrativ", "asistent", "kancelář", "zadávání dat", "fakturac", "účetn"]
+
+# --- Skóre shody (čím víc bodů, tím výš v e-mailu) ---
+POINTS_PRIORITY = 3          # za každé prioritní slovo (WordPress, e-shop, home office...)
+POINTS_PRIORITY_TITLE = 2    # bonus, pokud je prioritní slovo přímo v názvu inzerátu
+POINTS_ROLE = 1              # za každé slovo z ROLE_KEYWORDS
+POINTS_CONTRACT = 1          # za každé slovo z CONTRACT_KEYWORDS (DPP, brigáda...)
+POINTS_HIGH_RATE = 4         # bonus za hodinovou sazbu nad HIGH_RATE_PER_HOUR
+PENALTY = 2                  # odečet za každé slovo z PENALTY_KEYWORDS
+PENALTY_KEYWORDS = ["plný úvazek", "plny uvazek", "full-time", "full time", "fulltime", "směnn", "smenn"]
+RECOMMEND_MIN_SCORE = 6      # od kolika bodů se nabídka označí jako "Doporučeno"
+
+# Hodinová sazba, od které se nabídka zvýrazní.
+HIGH_RATE_PER_HOUR = 200
+
+# --- Deduplikace (aby ti nepřišel stejný inzerát dvakrát) ---
+SEEN_FILE = Path(__file__).resolve().parent / "seen.json"
+SEEN_KEEP_DAYS = 45          # po kolika dnech se inzerát z paměti zapomene
+
+# Parametry v odkazech, které jen sledují kliknutí a nemění samotný inzerát.
+TRACKING_PARAMS = {
+    "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "searchid", "sid", "cid",
+    "trk", "tracking", "campaign", "eid",
+}
 
 # E-mailové alerty z Prace.cz / Jobs.cz (čtou se z Gmailu přes IMAP).
 ALERT_SENDERS = ["prace.cz", "jobs.cz", "almacareer"]
@@ -151,6 +178,81 @@ def is_excluded(text: str) -> bool:
     return any(re.search(p, low) for p in EXCLUDE_PATTERNS)
 
 
+# ----------------------------- ODHAD SAZBY -----------------------------
+
+_NUM = r"\d{1,3}(?:[ \u00a0]\d{3})+|\d+"
+_RANGE = rf"({_NUM})(?:\s*(?:-|–|—|až)\s*({_NUM}))?"
+
+# "200 Kč/h", "200–250 Kč/hod", "150 Kč za hodinu", "180,- Kč na hodinu"
+HOURLY_RE = re.compile(
+    rf"{_RANGE}\s*(?:,-)?\s*(?:Kč|CZK|korun)?\s*(?:/\s*|\s+za\s+|\s+na\s+)(?:hod\w*|h(?!\w))",
+    re.I,
+)
+# "30 000 – 40 000 Kč", "30–40 tis. Kč" (jen když to není hodinová sazba)
+MONTHLY_RE = re.compile(
+    rf"{_RANGE}\s*(tis\.?|tisíc\w*)?\s*(?:,-)?\s*(?:Kč|CZK|korun)(?!\s*(?:/\s*|za\s+|na\s+)(?:hod|h(?!\w)))",
+    re.I,
+)
+
+
+def _to_int(value: str) -> int:
+    return int(re.sub(r"\D", "", value))
+
+
+def _fmt(n: int) -> str:
+    return f"{n:,}".replace(",", "\u00a0")
+
+
+def extract_rate(text: str):
+    """Vrátí {'kind': 'hour'|'month', 'label': str, 'hourly': int|None} nebo None."""
+    for m in HOURLY_RE.finditer(text or ""):
+        lo = _to_int(m.group(1))
+        hi = _to_int(m.group(2)) if m.group(2) else lo
+        if lo > hi:
+            lo, hi = hi, lo
+        if 50 <= lo and hi <= 2000:
+            label = f"{lo}–{hi} Kč/h" if lo != hi else f"{lo} Kč/h"
+            return {"kind": "hour", "label": label, "hourly": hi}
+
+    for m in MONTHLY_RE.finditer(text or ""):
+        lo = _to_int(m.group(1))
+        hi = _to_int(m.group(2)) if m.group(2) else lo
+        if m.group(3):
+            if lo < 1000:
+                lo *= 1000
+            if hi < 1000:
+                hi *= 1000
+        if lo > hi:
+            lo, hi = hi, lo
+        if 5000 <= lo and hi <= 300000:
+            label = f"{_fmt(lo)}–{_fmt(hi)} Kč/měs." if lo != hi else f"{_fmt(lo)} Kč/měs."
+            return {"kind": "month", "label": label, "hourly": None}
+    return None
+
+
+# ----------------------------- SKÓRE SHODY -----------------------------
+
+
+def score_job(job: dict, text: str) -> int:
+    score = 0
+    title = job["title"].lower()
+
+    for kw in find_keywords(text, PRIORITY_KEYWORDS):
+        score += POINTS_PRIORITY
+        if find_keywords(title, [kw]):
+            score += POINTS_PRIORITY_TITLE
+
+    score += POINTS_ROLE * len(job["roles"])
+    score += POINTS_CONTRACT * len(job["contracts"])
+
+    rate = job.get("rate")
+    if rate and rate["hourly"] and rate["hourly"] >= HIGH_RATE_PER_HOUR:
+        score += POINTS_HIGH_RATE
+
+    score -= PENALTY * len(find_keywords(text, PENALTY_KEYWORDS))
+    return score
+
+
 def filter_jobs(items: list) -> list:
     result, seen = [], set()
     for it in items:
@@ -178,10 +280,77 @@ def filter_jobs(items: list) -> list:
         seen.add(it["link"])
         it["roles"], it["contracts"], it["priority"] = roles, contracts, priority
         it["tags"] = list(dict.fromkeys(roles + contracts + priority))
+        it["rate"] = extract_rate(f'{it["title"]} {it["description"]}')
+        it["score"] = score_job(it, text)
+        it["recommended"] = it["score"] >= RECOMMEND_MIN_SCORE
         result.append(it)
 
-    result.sort(key=lambda j: -len(j["priority"]))
+    result.sort(key=lambda j: -j["score"])
     return result
+
+
+# ----------------------------- DEDUPLIKACE -----------------------------
+
+
+def normalize_link(link: str) -> str:
+    parts = urlsplit(link.strip())
+    query = [
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if not k.lower().startswith("utm_") and k.lower() not in TRACKING_PARAMS
+    ]
+    return urlunsplit((
+        parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"),
+        urlencode(sorted(query)), "",
+    ))
+
+
+def title_key(title: str) -> str:
+    t = unicodedata.normalize("NFKD", title.lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return "t:" + re.sub(r"[^a-z0-9]+", "", t)[:100]
+
+
+def job_keys(job: dict) -> list:
+    """Každý inzerát má dva 'otisky': odkaz a název. Stačí shoda v jednom z nich."""
+    return ["l:" + normalize_link(job["link"]), title_key(job["title"])]
+
+
+def load_seen() -> dict:
+    try:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("seen.json není slovník")
+    except FileNotFoundError:
+        return {}
+    except (ValueError, OSError) as exc:
+        print(f"[WARN] seen.json se nepodařilo načíst, začínám s prázdným: {exc}", file=sys.stderr)
+        return {}
+    cutoff = (date.today() - timedelta(days=SEEN_KEEP_DAYS)).isoformat()
+    return {k: v for k, v in data.items() if isinstance(v, str) and v >= cutoff}
+
+
+def drop_seen(jobs: list, seen: dict):
+    """Vyhodí inzeráty, které už byly poslány. Vrátí (nové, počet_duplicit)."""
+    fresh, dupes, run_keys = [], 0, set()
+    for job in jobs:
+        keys = job_keys(job)
+        if any(k in seen or k in run_keys for k in keys):
+            dupes += 1
+            continue
+        run_keys.update(keys)
+        fresh.append(job)
+    return fresh, dupes
+
+
+def save_seen(seen: dict, sent_jobs: list) -> None:
+    today = date.today().isoformat()
+    for job in sent_jobs:
+        for key in job_keys(job):
+            seen[key] = today
+    SEEN_FILE.write_text(
+        json.dumps(dict(sorted(seen.items())), ensure_ascii=False, indent=0) + "\n",
+        encoding="utf-8",
+    )
 
 
 # ----------------------------- ALERTY Z GMAILU -----------------------------
@@ -276,7 +445,7 @@ def fetch_alerts() -> list:
                 if any(w in subject.lower() for w in SKIP_SUBJECT_WORDS):
                     print(f"[SKIP] e-mail přeskočen (předmět): {subject[:80]}")
                     continue
-                date = str(msg.get("Date", ""))
+                date_hdr = str(msg.get("Date", ""))
 
                 for href, text in extract_links(content, is_html):
                     low = f"{text} {href}".lower()
@@ -292,7 +461,7 @@ def fetch_alerts() -> list:
                         "title": text,
                         "link": href,
                         "description": f"Z e-mailového upozornění: {subject}" if subject else "",
-                        "pubdate": date,
+                        "pubdate": date_hdr,
                         "source": "alert",
                         "trusted": True,
                     })
@@ -380,15 +549,42 @@ def build_html(jobs: list) -> str:
         )
         star = (
             '<div style="display:inline-block;background:#fef3c7;color:#92400e;border-radius:6px;'
-            'padding:3px 8px;font-size:12px;font-weight:bold;margin-bottom:8px;">⭐ Doporučeno</div><br>'
-            if job["priority"] else ""
+            'padding:3px 8px;font-size:12px;font-weight:bold;margin:0 6px 8px 0;">⭐ Doporučeno</div>'
+            if job["recommended"] else ""
         )
-        border_color = "#f59e0b" if job["priority"] else "#2563eb"
+
+        rate = job.get("rate")
+        rate_badge = ""
+        if rate:
+            high = bool(rate["hourly"] and rate["hourly"] >= HIGH_RATE_PER_HOUR)
+            if high:
+                bg, fg, icon = "#dcfce7", "#166534", "💰"
+                label = f'{rate["label"]} · nad {HIGH_RATE_PER_HOUR} Kč/h'
+            else:
+                bg, fg, icon = "#f1f5f9", "#334155", "💵"
+                label = rate["label"]
+            rate_badge = (
+                f'<div style="display:inline-block;background:{bg};color:{fg};border-radius:6px;'
+                f'padding:3px 8px;font-size:12px;font-weight:bold;margin:0 6px 8px 0;">{icon} {e(label)}</div>'
+            )
+
+        score_badge = (
+            f'<div style="display:inline-block;background:#f1f5f9;color:#475569;border-radius:6px;'
+            f'padding:3px 8px;font-size:12px;margin:0 0 8px 0;">Shoda: {job["score"]} b.</div>'
+        )
+        badges = f"<div>{star}{rate_badge}{score_badge}</div>"
+
+        if job["recommended"]:
+            border_color = "#f59e0b"
+        elif rate and rate["hourly"] and rate["hourly"] >= HIGH_RATE_PER_HOUR:
+            border_color = "#16a34a"
+        else:
+            border_color = "#2563eb"
         cards.append(f"""
         <tr><td style="padding:0 0 16px 0;">
           <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;border-left:5px solid {border_color};box-shadow:0 1px 3px rgba(0,0,0,0.05);">
             <tr><td style="padding:22px;">
-              {star}
+              {badges}
               <h2 style="margin:0 0 6px 0;font-size:18px;color:#0f172a;font-weight:700;">{e(job['title'])}</h2>
               {date_line}
               <div style="margin-bottom:12px;">{tags}</div>
@@ -404,7 +600,7 @@ def build_html(jobs: list) -> str:
           </table>
         </td></tr>""")
 
-    top_count = sum(1 for j in jobs if j['priority'])
+    top_count = sum(1 for j in jobs if j["recommended"])
     return f"""<!DOCTYPE html>
 <html lang="cs"><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
@@ -414,7 +610,7 @@ def build_html(jobs: list) -> str:
         <tr><td style="background:#0f172a;border-radius:14px 14px 0 0;padding:24px;">
           <div style="font-size:24px;font-weight:800;color:#ffffff;">Job Agent</div>
           <div style="font-size:14px;color:#94a3b8;margin-top:4px;">
-            Nalezeno nabídek: {len(jobs)} · doporučených: {top_count} · {datetime.now().strftime('%d. %m. %Y')}
+            Nových nabídek: {len(jobs)} · doporučených: {top_count} · {datetime.now().strftime('%d. %m. %Y')}
           </div>
         </td></tr>
         <tr><td style="background:#e2e8f0;padding:16px;border-radius:0 0 14px 14px;">
@@ -470,13 +666,22 @@ def main() -> int:
     jobs = filter_jobs(items)
     print(f"Po filtrování: {len(jobs)}")
 
+    seen = load_seen()
+    print(f"V paměti už odeslaných inzerátů (otisků): {len(seen)}")
+    jobs, dupes = drop_seen(jobs, seen)
+    print(f"Vyřazeno jako už odeslané: {dupes}, nových: {len(jobs)}")
+
     if not jobs:
-        print("Žádné odpovídající nabídky, e-mail se neodesílá.")
+        print("Žádné nové odpovídající nabídky, e-mail se neodesílá.")
         return 0
 
-    top = sum(1 for j in jobs if j["priority"])
-    send_email(f"Job Agent: {len(jobs)} nabídek ({top} doporučených)", build_html(jobs))
+    top = sum(1 for j in jobs if j["recommended"])
+    send_email(f"Job Agent: {len(jobs)} nových nabídek ({top} doporučených)", build_html(jobs))
     print("E-mail odeslán.")
+
+    # Zapisuje se až po úspěšném odeslání, aby se při chybě nic neztratilo.
+    save_seen(seen, jobs)
+    print(f"Uloženo do {SEEN_FILE.name}.")
     return 0
 
 
