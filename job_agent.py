@@ -76,6 +76,8 @@ POINTS_HIGH_RATE = 4         # bonus za hodinovou sazbu nad HIGH_RATE_PER_HOUR
 PENALTY = 2                  # odečet za každé slovo z PENALTY_KEYWORDS
 PENALTY_KEYWORDS = ["plný úvazek", "plny uvazek", "full-time", "full time", "fulltime", "směnn", "smenn"]
 RECOMMEND_MIN_SCORE = 7      # od kolika bodů se nabídka označí jako "Doporučeno"
+MAX_FULL_CARDS = 15          # max. počet nabídek s plnou kartou a motivačním textem, zbytek je v seznamu
+SEND_EMPTY_STATUS = True     # když nejsou žádné nové nabídky, pošle krátký e-mail s vysvětlením proč
 MIN_CARD_SCORE = 1           # nabídky s nižším skóre jsou jen v krátkém seznamu "Slabší shoda" (bez motivačního textu)
 
 # Hodinová sazba, od které se nabídka zvýrazní.
@@ -92,9 +94,9 @@ TRACKING_PARAMS = {
 }
 
 # E-mailové alerty z Prace.cz / Jobs.cz (čtou se z Gmailu přes IMAP).
-ALERT_SENDERS = ["prace.cz", "jobs.cz", "almacareer"]
-ALERT_DAYS = 2          # Kolik dní zpět se alerty čtou
-MAX_ALERT_ITEMS = 60    # Pojistka proti záplavě
+ALERT_SENDERS = ["prace.cz", "jobs.cz", "almacareer", "indeed", "jooble", "profesia"]
+ALERT_DAYS = 7          # Kolik dní zpět se alerty čtou (duplicity hlídá seen.json)
+MAX_ALERT_ITEMS = 200   # Pojistka proti záplavě
 
 # Odkazy v alertech, které nejsou nabídky (patička, odhlášení, sociální sítě...).
 SKIP_LINK_WORDS = [
@@ -566,8 +568,9 @@ def build_reply(job: dict) -> str:
 def build_html(jobs: list) -> str:
     e = html.escape
     cards = []
-    main_jobs = [j for j in jobs if j["score"] >= MIN_CARD_SCORE]
-    rest_jobs = [j for j in jobs if j["score"] < MIN_CARD_SCORE]
+    ranked = [j for j in jobs if j["score"] >= MIN_CARD_SCORE]
+    main_jobs = ranked[:MAX_FULL_CARDS]
+    rest_jobs = ranked[MAX_FULL_CARDS:] + [j for j in jobs if j["score"] < MIN_CARD_SCORE]
     for job in main_jobs:
         desc = job["description"]
         if len(desc) > 400:
@@ -649,7 +652,7 @@ def build_html(jobs: list) -> str:
             '<tr><td style="padding:0;"><table width="100%" cellpadding="0" cellspacing="0" '
             'style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;">'
             '<tr><td style="padding:18px 22px;">'
-            '<div style="font-size:15px;font-weight:700;color:#0f172a;margin-bottom:4px;">Slabší shoda</div>'
+            '<div style="font-size:15px;font-weight:700;color:#0f172a;margin-bottom:4px;">Další nabídky</div>'
             '<div style="font-size:12px;color:#64748b;margin-bottom:8px;">Jen odkazy, bez připraveného textu.</div>'
             '<table width="100%" cellpadding="0" cellspacing="0">' + "".join(rows) + '</table>'
             '</td></tr></table></td></tr>'
@@ -665,7 +668,7 @@ def build_html(jobs: list) -> str:
         <tr><td style="background:#0f172a;border-radius:14px 14px 0 0;padding:24px;">
           <div style="font-size:24px;font-weight:800;color:#ffffff;">Job Agent</div>
           <div style="font-size:14px;color:#94a3b8;margin-top:4px;">
-            Nových nabídek: {len(jobs)} · doporučených: {top_count} · slabší shoda: {len(rest_jobs)} · {datetime.now().strftime('%d. %m. %Y')}
+            Nových nabídek: {len(jobs)} · doporučených: {top_count} · dalších v seznamu: {len(rest_jobs)} · {datetime.now().strftime('%d. %m. %Y')}
           </div>
         </td></tr>
         <tr><td style="background:#e2e8f0;padding:16px;border-radius:0 0 14px 14px;">
@@ -677,6 +680,25 @@ def build_html(jobs: list) -> str:
     </td></tr>
   </table>
 </body></html>"""
+
+
+def send_status(fetched: int, matched: int, dupes: int) -> None:
+    if fetched == 0:
+        reason = (f"V e-mailových alertech za posledních {ALERT_DAYS} dní jsem nenašel žádné nabídky. "
+                  "Zkontroluj, jestli ti v Gmailu chodí alerty z Jobs.cz a Práce.cz.")
+    elif matched == 0:
+        reason = f"Našel jsem {fetched} položek, ale filtry je všechny vyřadily."
+    else:
+        reason = (f"Našel jsem {matched} odpovídajících nabídek, ale všechny už jsi dostal dříve "
+                  f"({dupes} duplicit).")
+    body = (
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:600px;'
+        'margin:20px auto;padding:20px;background:#f1f5f9;border-radius:12px;">'
+        '<div style="font-size:20px;font-weight:800;color:#0f172a;margin-bottom:8px;">Job Agent</div>'
+        '<div style="font-size:14px;color:#334155;line-height:1.6;">Dnes žádné nové nabídky.<br>'
+        f'{html.escape(reason)}</div></div>'
+    )
+    send_email("Job Agent: dnes žádné nové nabídky", body)
 
 
 def send_email(subject: str, html_body: str) -> None:
@@ -719,7 +741,8 @@ def main() -> int:
     print(f"Staženo položek: {len(items)}")
 
     jobs = filter_jobs(items)
-    print(f"Po filtrování: {len(jobs)}")
+    matched = len(jobs)
+    print(f"Po filtrování: {matched}")
 
     seen = load_seen()
     print(f"V paměti už odeslaných inzerátů (otisků): {len(seen)}")
@@ -727,7 +750,10 @@ def main() -> int:
     print(f"Vyřazeno jako už odeslané: {dupes}, nových: {len(jobs)}")
 
     if not jobs:
-        print("Žádné nové odpovídající nabídky, e-mail se neodesílá.")
+        print("Žádné nové odpovídající nabídky.")
+        if SEND_EMPTY_STATUS:
+            send_status(len(items), matched, dupes)
+            print("Odeslán stavový e-mail.")
         return 0
 
     top = sum(1 for j in jobs if j["recommended"])
