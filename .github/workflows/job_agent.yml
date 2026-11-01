@@ -6,6 +6,15 @@ on:
     - cron: "5 18 * * *"   # 19:05 v zimě (CET)
   workflow_dispatch:
 
+# Potřeba, aby workflow mohl uložit seen.json zpět do repozitáře.
+permissions:
+  contents: write
+
+# Dva běhy najednou by si přepsaly seen.json.
+concurrency:
+  group: job-agent
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -25,3 +34,20 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '19' || '' }}
+
+      - name: Uložit seznam odeslaných inzerátů
+        run: |
+          if [ -f seen.json ]; then
+            git config user.name "job-agent[bot]"
+            git config user.email "job-agent@users.noreply.github.com"
+            git add seen.json
+            if git diff --cached --quiet; then
+              echo "seen.json beze změn."
+            else
+              git commit -m "Aktualizace seen.json"
+              git pull --rebase
+              git push
+            fi
+          else
+            echo "seen.json zatím neexistuje (nebylo co poslat)."
+          fi
