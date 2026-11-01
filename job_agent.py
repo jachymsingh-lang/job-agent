@@ -50,6 +50,8 @@ EXCLUDE_PATTERNS = [
     r"ukl[ií]d\w*", r"úklid\w*", r"ukl[ií]z\w*",
     r"(?<!\w)bar(?:u|em|e|ech|y|ů)?(?!\w)", r"barman\w*", r"bartend\w*",
     r"číšn\w*", r"cisn\w*",
+    r"řidič\w*", r"ridic\w*", r"kurýr\w*", r"kuryr\w*", r"kuchař\w*",
+    r"(?<!\w)sestr\w*", r"mechanik\w*", r"sklad(?:ov|n)\w*",
 ]
 
 # Nabídky s těmito výrazy se řadí nahoru a dostanou označení "Doporučeno".
@@ -73,7 +75,8 @@ POINTS_CONTRACT = 1          # za každé slovo z CONTRACT_KEYWORDS (DPP, brigá
 POINTS_HIGH_RATE = 4         # bonus za hodinovou sazbu nad HIGH_RATE_PER_HOUR
 PENALTY = 2                  # odečet za každé slovo z PENALTY_KEYWORDS
 PENALTY_KEYWORDS = ["plný úvazek", "plny uvazek", "full-time", "full time", "fulltime", "směnn", "smenn"]
-RECOMMEND_MIN_SCORE = 6      # od kolika bodů se nabídka označí jako "Doporučeno"
+RECOMMEND_MIN_SCORE = 7      # od kolika bodů se nabídka označí jako "Doporučeno"
+MIN_CARD_SCORE = 1           # nabídky s nižším skóre jsou jen v krátkém seznamu "Slabší shoda" (bez motivačního textu)
 
 # Hodinová sazba, od které se nabídka zvýrazní.
 HIGH_RATE_PER_HOUR = 200
@@ -212,7 +215,13 @@ def extract_rate(text: str):
             lo, hi = hi, lo
         if 50 <= lo and hi <= 2000:
             label = f"{lo}–{hi} Kč/h" if lo != hi else f"{lo} Kč/h"
-            return {"kind": "hour", "label": label, "hourly": hi}
+            before = (text[max(0, m.start() - 6):m.start()]).lower()
+            upto = bool(re.search(r"(?:až|do)\s*$", before))
+            if upto:
+                label = "až " + label
+            mid = (lo + hi) // 2
+            return {"kind": "hour", "label": label, "hourly": mid,
+                    "high": (not upto) and mid >= HIGH_RATE_PER_HOUR}
 
     for m in MONTHLY_RE.finditer(text or ""):
         lo = _to_int(m.group(1))
@@ -226,7 +235,7 @@ def extract_rate(text: str):
             lo, hi = hi, lo
         if 5000 <= lo and hi <= 300000:
             label = f"{_fmt(lo)}–{_fmt(hi)} Kč/měs." if lo != hi else f"{_fmt(lo)} Kč/měs."
-            return {"kind": "month", "label": label, "hourly": None}
+            return {"kind": "month", "label": label, "hourly": None, "high": False}
     return None
 
 
@@ -246,7 +255,7 @@ def score_job(job: dict, text: str) -> int:
     score += POINTS_CONTRACT * len(job["contracts"])
 
     rate = job.get("rate")
-    if rate and rate["hourly"] and rate["hourly"] >= HIGH_RATE_PER_HOUR:
+    if rate and rate.get("high"):
         score += POINTS_HIGH_RATE
 
     score -= PENALTY * len(find_keywords(text, PENALTY_KEYWORDS))
@@ -265,7 +274,8 @@ def filter_jobs(items: list) -> list:
             continue
 
         if trusted:
-            roles, contracts = [], []
+            roles = find_keywords(text, ROLE_KEYWORDS)
+            contracts = find_keywords(text, CONTRACT_KEYWORDS)
         else:
             roles = find_keywords(text, ROLE_KEYWORDS)
             contracts = find_keywords(text, CONTRACT_KEYWORDS)
@@ -409,6 +419,27 @@ def find_all_mail_folder(imap) -> str:
     return "INBOX"
 
 
+def source_label(href: str) -> str:
+    host = urlsplit(href).netloc.lower()
+    for key, name in (("jobs.cz", "Jobs.cz"), ("prace.cz", "Práce.cz"), ("almacareer", "Alma Career")):
+        if key in host:
+            return name
+    return "e-mailový alert"
+
+
+def pretty_date(pubdate: str) -> str:
+    if not pubdate:
+        return ""
+    try:
+        dt = parsedate_to_datetime(pubdate)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(ZoneInfo("Europe/Prague"))
+        return f"{dt.day}. {dt.month}. {dt.year}"
+    except (TypeError, ValueError):
+        return pubdate
+
+
 def fetch_alerts() -> list:
     sender = os.environ["SENDER_EMAIL"]
     password = os.environ["SENDER_PASSWORD"]
@@ -460,7 +491,8 @@ def fetch_alerts() -> list:
                     items.append({
                         "title": text,
                         "link": href,
-                        "description": f"Z e-mailového upozornění: {subject}" if subject else "",
+                        "description": "",
+                        "source_name": source_label(href),
                         "pubdate": date_hdr,
                         "source": "alert",
                         "trusted": True,
@@ -534,7 +566,9 @@ def build_reply(job: dict) -> str:
 def build_html(jobs: list) -> str:
     e = html.escape
     cards = []
-    for job in jobs:
+    main_jobs = [j for j in jobs if j["score"] >= MIN_CARD_SCORE]
+    rest_jobs = [j for j in jobs if j["score"] < MIN_CARD_SCORE]
+    for job in main_jobs:
         desc = job["description"]
         if len(desc) > 400:
             desc = desc[:400].rsplit(" ", 1)[0] + "…"
@@ -543,9 +577,10 @@ def build_html(jobs: list) -> str:
             f'border-radius:12px;padding:3px 10px;margin:2px 4px 2px 0;font-size:12px;font-weight:500;">{e(t)}</span>'
             for t in job["tags"]
         )
+        meta = " · ".join(x for x in (job.get("source_name"), pretty_date(job["pubdate"])) if x)
         date_line = (
-            f'<div style="color:#64748b;font-size:12px;margin-bottom:8px;">{e(job["pubdate"])}</div>'
-            if job["pubdate"] else ""
+            f'<div style="color:#64748b;font-size:12px;margin-bottom:8px;">{e(meta)}</div>'
+            if meta else ""
         )
         star = (
             '<div style="display:inline-block;background:#fef3c7;color:#92400e;border-radius:6px;'
@@ -556,10 +591,10 @@ def build_html(jobs: list) -> str:
         rate = job.get("rate")
         rate_badge = ""
         if rate:
-            high = bool(rate["hourly"] and rate["hourly"] >= HIGH_RATE_PER_HOUR)
+            high = bool(rate.get("high"))
             if high:
                 bg, fg, icon = "#dcfce7", "#166534", "💰"
-                label = f'{rate["label"]} · nad {HIGH_RATE_PER_HOUR} Kč/h'
+                label = rate["label"]
             else:
                 bg, fg, icon = "#f1f5f9", "#334155", "💵"
                 label = rate["label"]
@@ -576,7 +611,7 @@ def build_html(jobs: list) -> str:
 
         if job["recommended"]:
             border_color = "#f59e0b"
-        elif rate and rate["hourly"] and rate["hourly"] >= HIGH_RATE_PER_HOUR:
+        elif rate and rate.get("high"):
             border_color = "#16a34a"
         else:
             border_color = "#2563eb"
@@ -600,6 +635,26 @@ def build_html(jobs: list) -> str:
           </table>
         </td></tr>""")
 
+    rest_block = ""
+    if rest_jobs:
+        rows = []
+        for j in rest_jobs:
+            r = j.get("rate")
+            r_txt = f' <span style="color:#166534;font-weight:bold;">· {e(r["label"])}</span>' if r else ""
+            rows.append(
+                '<tr><td style="padding:9px 0;border-bottom:1px solid #e2e8f0;font-size:14px;line-height:1.4;">'
+                f'<a href="{e(j["link"])}" style="color:#1d4ed8;text-decoration:none;">{e(j["title"])}</a>{r_txt}</td></tr>'
+            )
+        rest_block = (
+            '<tr><td style="padding:0;"><table width="100%" cellpadding="0" cellspacing="0" '
+            'style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;">'
+            '<tr><td style="padding:18px 22px;">'
+            '<div style="font-size:15px;font-weight:700;color:#0f172a;margin-bottom:4px;">Slabší shoda</div>'
+            '<div style="font-size:12px;color:#64748b;margin-bottom:8px;">Jen odkazy, bez připraveného textu.</div>'
+            '<table width="100%" cellpadding="0" cellspacing="0">' + "".join(rows) + '</table>'
+            '</td></tr></table></td></tr>'
+        )
+
     top_count = sum(1 for j in jobs if j["recommended"])
     return f"""<!DOCTYPE html>
 <html lang="cs"><head><meta charset="utf-8"></head>
@@ -610,12 +665,12 @@ def build_html(jobs: list) -> str:
         <tr><td style="background:#0f172a;border-radius:14px 14px 0 0;padding:24px;">
           <div style="font-size:24px;font-weight:800;color:#ffffff;">Job Agent</div>
           <div style="font-size:14px;color:#94a3b8;margin-top:4px;">
-            Nových nabídek: {len(jobs)} · doporučených: {top_count} · {datetime.now().strftime('%d. %m. %Y')}
+            Nových nabídek: {len(jobs)} · doporučených: {top_count} · slabší shoda: {len(rest_jobs)} · {datetime.now().strftime('%d. %m. %Y')}
           </div>
         </td></tr>
         <tr><td style="background:#e2e8f0;padding:16px;border-radius:0 0 14px 14px;">
           <table width="100%" cellpadding="0" cellspacing="0">
-            {''.join(cards)}
+            {''.join(cards)}{rest_block}
           </table>
         </td></tr>
       </table>
