@@ -11,7 +11,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes, policy
-from email.utils import parsedate_to_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -122,6 +122,17 @@ NAME = "Jáchym Singh"
 PHONE = "773 941 841"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (JobAgent)"}
+
+# --- Jooble API (volitelné; zapne se jen když je v GitHub Secrets JOOBLE_API_KEY) ---
+JOOBLE_QUERIES = [
+    "brigáda", "part-time", "DPP", "administrativa", "asistent",
+    "e-shop", "marketing", "home office", "student", "copywriter",
+]
+JOOBLE_LOCATION = "Praha"
+JOOBLE_PER_QUERY = 20
+
+# Počty z posledního běhu, které se ukážou ve stavovém e-mailu.
+STATS = {"alert_mails": None, "alert_newest": "", "jooble": ""}
 
 # ----------------------------- POMOCNÉ FUNKCE -----------------------------
 
@@ -306,6 +317,8 @@ def filter_jobs(items: list) -> list:
 
 def normalize_link(link: str) -> str:
     parts = urlsplit(link.strip())
+    if "jooble." in parts.netloc.lower():
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
     query = [
         (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
         if not k.lower().startswith("utm_") and k.lower() not in TRACKING_PARAMS
@@ -324,7 +337,7 @@ def title_key(title: str) -> str:
 
 def job_keys(job: dict) -> list:
     """Každý inzerát má dva 'otisky': odkaz a název. Stačí shoda v jednom z nich."""
-    return ["l:" + normalize_link(job["link"]), title_key(job["title"])]
+    return ["l:" + normalize_link(job["link"]), title_key(job["title"] + " " + job.get("company", ""))]
 
 
 def load_seen() -> dict:
@@ -421,6 +434,54 @@ def find_all_mail_folder(imap) -> str:
     return "INBOX"
 
 
+def fetch_jooble() -> list:
+    key = os.environ.get("JOOBLE_API_KEY")
+    if not key:
+        STATS["jooble"] = "vypnuto (chybí JOOBLE_API_KEY)"
+        return []
+    items, errors = [], 0
+    for query in JOOBLE_QUERIES:
+        try:
+            resp = requests.post(
+                f"https://jooble.org/api/{key}",
+                json={"keywords": query, "location": JOOBLE_LOCATION},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            found = resp.json().get("jobs", [])
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            errors += 1
+            print(f"[WARN] Jooble dotaz '{query}' selhal: {exc}", file=sys.stderr)
+            continue
+        for j in found[:JOOBLE_PER_QUERY]:
+            link = (j.get("link") or "").strip()
+            title = strip_html(j.get("title", ""))
+            if not link or not title:
+                continue
+            company = strip_html(j.get("company", ""))
+            parts = [p for p in (company, strip_html(j.get("snippet", ""))) if p]
+            if j.get("salary"):
+                parts.append(f'Mzda: {strip_html(str(j["salary"]))}')
+            pub = ""
+            try:
+                pub = format_datetime(datetime.fromisoformat(str(j.get("updated", "")).replace("Z", "+00:00")))
+            except ValueError:
+                pass
+            items.append({
+                "title": title,
+                "link": link,
+                "company": company,
+                "description": " · ".join(parts),
+                "pubdate": pub,
+                "source": "jooble",
+                "source_name": "Jooble",
+                "trusted": True,
+            })
+    STATS["jooble"] = f"{len(items)} nabídek" + (f", {errors} dotazů selhalo" if errors else "")
+    print(f"Jooble: {STATS['jooble']}")
+    return items
+
+
 def source_label(href: str) -> str:
     host = urlsplit(href).netloc.lower()
     for key, name in (("jobs.cz", "Jobs.cz"), ("prace.cz", "Práce.cz"), ("almacareer", "Alma Career")):
@@ -463,6 +524,7 @@ def fetch_alerts() -> list:
                 return []
             ids = data[0].split()
             print(f"Nalezeno alert e-mailů: {len(ids)}")
+            STATS["alert_mails"] = len(ids)
 
             for num in ids:
                 status, msg_data = imap.fetch(num, "(RFC822)")
@@ -479,6 +541,7 @@ def fetch_alerts() -> list:
                     print(f"[SKIP] e-mail přeskočen (předmět): {subject[:80]}")
                     continue
                 date_hdr = str(msg.get("Date", ""))
+                STATS["alert_newest"] = pretty_date(date_hdr)
 
                 for href, text in extract_links(content, is_html):
                     low = f"{text} {href}".lower()
@@ -691,12 +754,19 @@ def send_status(fetched: int, matched: int, dupes: int) -> None:
     else:
         reason = (f"Našel jsem {matched} odpovídajících nabídek, ale všechny už jsi dostal dříve "
                   f"({dupes} duplicit).")
+    mails = STATS["alert_mails"]
+    details = (
+        f"Alert e-maily v Gmailu za posledních {ALERT_DAYS} dní: "
+        + ("nepodařilo se zjistit" if mails is None else
+           f"{mails}" + (f", nejnovější z {STATS['alert_newest']}" if STATS["alert_newest"] else ""))
+        + f". Jooble: {STATS['jooble'] or 'nepoužito'}."
+    )
     body = (
         '<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:600px;'
         'margin:20px auto;padding:20px;background:#f1f5f9;border-radius:12px;">'
         '<div style="font-size:20px;font-weight:800;color:#0f172a;margin-bottom:8px;">Job Agent</div>'
         '<div style="font-size:14px;color:#334155;line-height:1.6;">Dnes žádné nové nabídky.<br>'
-        f'{html.escape(reason)}</div></div>'
+        f'{html.escape(reason)}<br><br>{html.escape(details)}</div></div>'
     )
     send_email("Job Agent: dnes žádné nové nabídky", body)
 
@@ -738,6 +808,7 @@ def main() -> int:
     for url in FEEDS:
         items.extend(fetch_feed(url))
     items.extend(fetch_alerts())
+    items.extend(fetch_jooble())
     print(f"Staženo položek: {len(items)}")
 
     jobs = filter_jobs(items)
