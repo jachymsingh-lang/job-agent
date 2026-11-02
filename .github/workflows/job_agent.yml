@@ -33,6 +33,7 @@ jobs:
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
           ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '19' || '' }}
 
       - name: Uložit seznam odeslaných inzerátů
