@@ -275,6 +275,14 @@ def score_job(job: dict, text: str) -> int:
     return score
 
 
+# Pořadí zdrojů v e-mailu: nižší číslo = výš. Alerty z Jobs.cz a Práce.cz první, Jooble na konci.
+SOURCE_ORDER = {"alert": 0, "jooble": 2}
+
+
+def sort_key(job: dict):
+    return (SOURCE_ORDER.get(job.get("source"), 1), -job["score"])
+
+
 def filter_jobs(items: list) -> list:
     result, seen = [], set()
     for it in items:
@@ -308,7 +316,7 @@ def filter_jobs(items: list) -> list:
         it["recommended"] = it["score"] >= RECOMMEND_MIN_SCORE
         result.append(it)
 
-    result.sort(key=lambda j: -j["score"])
+    result.sort(key=sort_key)
     return result
 
 
@@ -633,7 +641,10 @@ def build_html(jobs: list) -> str:
     cards = []
     ranked = [j for j in jobs if j["score"] >= MIN_CARD_SCORE]
     main_jobs = ranked[:MAX_FULL_CARDS]
-    rest_jobs = ranked[MAX_FULL_CARDS:] + [j for j in jobs if j["score"] < MIN_CARD_SCORE]
+    rest_jobs = sorted(
+        ranked[MAX_FULL_CARDS:] + [j for j in jobs if j["score"] < MIN_CARD_SCORE],
+        key=sort_key,
+    )
     for job in main_jobs:
         desc = job["description"]
         if len(desc) > 400:
@@ -707,6 +718,8 @@ def build_html(jobs: list) -> str:
         for j in rest_jobs:
             r = j.get("rate")
             r_txt = f' <span style="color:#166534;font-weight:bold;">· {e(r["label"])}</span>' if r else ""
+            if j.get("source_name"):
+                r_txt += f' <span style="color:#94a3b8;font-size:12px;">· {e(j["source_name"])}</span>'
             rows.append(
                 '<tr><td style="padding:9px 0;border-bottom:1px solid #e2e8f0;font-size:14px;line-height:1.4;">'
                 f'<a href="{e(j["link"])}" style="color:#1d4ed8;text-decoration:none;">{e(j["title"])}</a>{r_txt}</td></tr>'
