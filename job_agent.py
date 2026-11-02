@@ -132,7 +132,7 @@ JOOBLE_LOCATION = "Praha"
 JOOBLE_PER_QUERY = 20
 
 # Počty z posledního běhu, které se ukážou ve stavovém e-mailu.
-STATS = {"alert_mails": None, "alert_newest": "", "jooble": ""}
+STATS = {"alert_mails": None, "alert_newest": "", "jooble": "", "breakdown": ""}
 
 # ----------------------------- POMOCNÉ FUNKCE -----------------------------
 
@@ -345,7 +345,10 @@ def title_key(title: str) -> str:
 
 def job_keys(job: dict) -> list:
     """Každý inzerát má dva 'otisky': odkaz a název. Stačí shoda v jednom z nich."""
-    return ["l:" + normalize_link(job["link"]), title_key(job["title"] + " " + job.get("company", ""))]
+    key = title_key(job["title"] + " " + job.get("company", ""))
+    if "jooble." in urlsplit(job["link"]).netloc.lower():
+        return [key]
+    return ["l:" + normalize_link(job["link"]), key]
 
 
 def load_seen() -> dict:
@@ -773,6 +776,7 @@ def send_status(fetched: int, matched: int, dupes: int) -> None:
         + ("nepodařilo se zjistit" if mails is None else
            f"{mails}" + (f", nejnovější z {STATS['alert_newest']}" if STATS["alert_newest"] else ""))
         + f". Jooble: {STATS['jooble'] or 'nepoužito'}."
+        + (f" {STATS['breakdown']}" if STATS["breakdown"] else "")
     )
     body = (
         '<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:600px;'
@@ -830,7 +834,14 @@ def main() -> int:
 
     seen = load_seen()
     print(f"V paměti už odeslaných inzerátů (otisků): {len(seen)}")
+    matched_jobs = jobs
     jobs, dupes = drop_seen(jobs, seen)
+    count = lambda lst, src: sum(1 for j in lst if j.get("source") == src)
+    STATS["breakdown"] = (
+        f"Z alertů: nalezeno {count(matched_jobs, 'alert')}, nových {count(jobs, 'alert')}. "
+        f"Z Jooble: nalezeno {count(matched_jobs, 'jooble')}, nových {count(jobs, 'jooble')}."
+    )
+    print(STATS["breakdown"])
     print(f"Vyřazeno jako už odeslané: {dupes}, nových: {len(jobs)}")
 
     if not jobs:
