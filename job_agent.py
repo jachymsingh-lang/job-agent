@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Job Agent – hlídání pracovních příležitostí v Praze přes RSS + e-mail přes Resend."""
+"""Job Agent – hlídání pracovních příležitostí v Praze (Práce.cz přímo z webu, e-mailové alerty, Jooble) + e-mail přes Resend."""
 
 import html
 import imaplib
@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
@@ -78,7 +79,7 @@ PENALTY_KEYWORDS = ["plný úvazek", "plny uvazek", "full-time", "full time", "f
 RECOMMEND_MIN_SCORE = 7      # od kolika bodů se nabídka označí jako "Doporučeno"
 MAX_FULL_CARDS = 15          # max. počet nabídek s plnou kartou a motivačním textem, zbytek je v seznamu
 SEND_EMPTY_STATUS = True     # když nejsou žádné nové nabídky, pošle krátký e-mail s vysvětlením proč
-MIN_CARD_SCORE = 1           # nabídky s nižším skóre jsou jen v krátkém seznamu "Slabší shoda" (bez motivačního textu)
+MIN_CARD_SCORE = 3           # nabídky s nižším skóre jsou jen v krátkém seznamu "Další nabídky" (bez motivačního textu)
 
 # Hodinová sazba, od které se nabídka zvýrazní.
 HIGH_RATE_PER_HOUR = 200
@@ -90,7 +91,7 @@ SEEN_KEEP_DAYS = 45          # po kolika dnech se inzerát z paměti zapomene
 # Parametry v odkazech, které jen sledují kliknutí a nemění samotný inzerát.
 TRACKING_PARAMS = {
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "searchid", "sid", "cid",
-    "trk", "tracking", "campaign", "eid",
+    "trk", "tracking", "campaign", "eid", "rps",
 }
 
 # E-mailové alerty z Prace.cz / Jobs.cz (čtou se z Gmailu přes IMAP).
@@ -110,6 +111,10 @@ SKIP_LINK_WORDS = [
     "kritéria", "kriteria", "poradna", "rady a tipy",
     "potvrdit", "potvrďte", "potvrdte", "potvrzujeme", "zrušte", "zrusite",
     "ověřit", "overit", "přihlásit", "prihlasit", "heslo",
+    # patičky a odkazy z alertů (Jooble, Práce.cz)
+    "upravit upozornění", "upravit upozorneni", "zásady", "zasady", "zobrazit všechna",
+    "zobrazit vsechna", "zobrazit volné", "zobrazit volne", "jednorázové brigády",
+    "jednorazove brigady", "alertview", "/subscriptions", "/privacy",
 ]
 
 # E-maily s těmito slovy v předmětu se přeskočí (potvrzení vlastních odpovědí apod.).
@@ -130,9 +135,30 @@ JOOBLE_QUERIES = [
 ]
 JOOBLE_LOCATION = "Praha"
 JOOBLE_PER_QUERY = 20
+JOOBLE_REQUIRE_PRAGUE = True   # zahodí nabídky, které mají uvedenou lokalitu mimo Prahu
+
+# --- Práce.cz přímo z webu (místo/vedle e-mailových alertů) ---
+# Adresa hledání s filtry. Postup: na Práce.cz nastav filtry, zkopíruj adresu z prohlížeče a vlož sem.
+# Tady jsou jen obory (professionIds) a typ práce (brigáda / částečný úvazek). Skupiny oborů
+# (workAreaIds) jsou vynechané, protože s nimi web ukazoval skoro 1 550 nabídek včetně kadeřnic a kurýrů.
+PRACE_SEARCH_URL = (
+    "https://www.prace.cz/hledat/?professionIds%5B%5D=201100006&professionIds%5B%5D=201100396"
+    "&professionIds%5B%5D=201100394&professionIds%5B%5D=201100418&professionIds%5B%5D=201100375"
+    "&professionIds%5B%5D=201100514&professionIds%5B%5D=201100608&professionIds%5B%5D=201100526"
+    "&professionIds%5B%5D=201100289&professionIds%5B%5D=201100002&professionIds%5B%5D=201100193"
+    "&professionIds%5B%5D=201100223&jobTypes%5B%5D=TEMPORARY_JOB&jobTypes%5B%5D=PART_TIME"
+)
+PRACE_PAGES = 5                      # kolik stránek výsledků se prochází (40 nabídek na stránku)
+PRACE_PAUSE = 2                      # pauza mezi stránkami (sekundy)
+PRACE_LOCATION_WORDS = ("praha",)    # jen nabídky s tímto slovem v lokalitě; () = bez filtru
+PRACE_REQUIRE_KEYWORD = True         # název musí obsahovat aspoň jedno slovo z ROLE_KEYWORDS / PRIORITY_KEYWORDS
+PRACE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "cs,en;q=0.8",
+}
 
 # Počty z posledního běhu, které se ukážou ve stavovém e-mailu.
-STATS = {"alert_mails": None, "alert_newest": "", "jooble": "", "breakdown": ""}
+STATS = {"alert_mails": None, "alert_newest": "", "jooble": "", "prace": "", "breakdown": ""}
 
 # ----------------------------- POMOCNÉ FUNKCE -----------------------------
 
@@ -275,8 +301,8 @@ def score_job(job: dict, text: str) -> int:
     return score
 
 
-# Pořadí zdrojů v e-mailu: nižší číslo = výš. Alerty z Jobs.cz a Práce.cz první, Jooble na konci.
-SOURCE_ORDER = {"alert": 0, "jooble": 2}
+# Pořadí zdrojů v e-mailu: nižší číslo = výš. Práce.cz (web i alerty) první, Jooble na konci.
+SOURCE_ORDER = {"prace": 0, "alert": 0, "jooble": 2}
 
 
 def sort_key(job: dict):
@@ -445,12 +471,106 @@ def find_all_mail_folder(imap) -> str:
     return "INBOX"
 
 
+# ----------------------------- PRÁCE.CZ PŘÍMO Z WEBU -----------------------------
+
+PRACE_TITLE_RE = re.compile(
+    r'data-testid="job-card-title"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S
+)
+PRACE_FIELD_RE = re.compile(
+    r'<span class="accessibility-hidden">([^<]+?)<!-- -->:</span>(?:<span[^>]*>)?([^<]*)'
+)
+
+
+def parse_prace_cards(page: str) -> list:
+    """Z HTML stránky s výsledky hledání vytáhne karty nabídek (název, odkaz, firma, lokalita, typ úvazku, plat)."""
+    cards = []
+    for block in page.split('<article id="advert-')[1:]:
+        block = block.split("</article>")[0]
+        m = PRACE_TITLE_RE.search(block)
+        if not m:
+            continue
+        href = html.unescape(m.group(1)).strip()
+        if href.startswith("/"):
+            href = "https://www.prace.cz" + href
+        fields = {k.strip(): strip_html(v) for k, v in PRACE_FIELD_RE.findall(block)}
+        cards.append({
+            "link": href,
+            "title": strip_html(m.group(2)),
+            "fields": fields,
+            "today": bool(re.search(r">(?:Dnešní|Jen pár hodin)<", block)),
+        })
+    return cards
+
+
+def fetch_prace() -> list:
+    if not PRACE_SEARCH_URL:
+        STATS["prace"] = "vypnuto"
+        return []
+
+    items, seen_links = [], set()
+    total = skipped_loc = skipped_kw = pages_ok = 0
+
+    for page_no in range(1, PRACE_PAGES + 1):
+        url = PRACE_SEARCH_URL if page_no == 1 else f"{PRACE_SEARCH_URL}&page={page_no}"
+        try:
+            resp = requests.get(url, headers=PRACE_HEADERS, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"[WARN] Práce.cz, strana {page_no} se nepodařilo načíst: {exc}", file=sys.stderr)
+            break
+        cards = parse_prace_cards(resp.text)
+        pages_ok += 1
+        if not cards:
+            print(f"[WARN] Práce.cz, strana {page_no}: nenašel jsem žádné nabídky (změnil se web?)", file=sys.stderr)
+            break
+
+        for c in cards:
+            total += 1
+            if c["link"] in seen_links:
+                continue
+            seen_links.add(c["link"])
+
+            location = c["fields"].get("Lokalita", "")
+            if PRACE_LOCATION_WORDS and not any(w in location.lower() for w in PRACE_LOCATION_WORDS):
+                skipped_loc += 1
+                continue
+            if PRACE_REQUIRE_KEYWORD and not find_keywords(c["title"], ROLE_KEYWORDS + PRIORITY_KEYWORDS):
+                skipped_kw += 1
+                continue
+
+            company = c["fields"].get("Název firmy", "")
+            parts = [p for p in (company, location, c["fields"].get("Typ úvazku", "")) if p]
+            if c["fields"].get("Plat"):
+                parts.append(f'Mzda: {c["fields"]["Plat"]}')
+            items.append({
+                "title": c["title"],
+                "link": c["link"],
+                "company": company,
+                "description": " · ".join(parts),
+                "pubdate": format_datetime(datetime.now(timezone.utc)) if c["today"] else "",
+                "source": "prace",
+                "source_name": "Práce.cz",
+                "trusted": True,
+            })
+
+        if page_no < PRACE_PAGES:
+            time.sleep(PRACE_PAUSE)
+
+    if pages_ok == 0:
+        STATS["prace"] = "nepodařilo se načíst (viz log)"
+    else:
+        STATS["prace"] = (f"{len(items)} nabídek z {total} (mimo Prahu: {skipped_loc}, "
+                          f"bez klíčového slova v názvu: {skipped_kw})")
+    print(f"Práce.cz (web): {STATS['prace']}")
+    return items
+
+
 def fetch_jooble() -> list:
     key = os.environ.get("JOOBLE_API_KEY")
     if not key:
         STATS["jooble"] = "vypnuto (chybí JOOBLE_API_KEY)"
         return []
-    items, errors = [], 0
+    items, errors, outside = [], 0, 0
     for query in JOOBLE_QUERIES:
         try:
             resp = requests.post(
@@ -468,6 +588,10 @@ def fetch_jooble() -> list:
             link = (j.get("link") or "").strip()
             title = strip_html(j.get("title", ""))
             if not link or not title:
+                continue
+            location = strip_html(j.get("location", "")).lower()
+            if JOOBLE_REQUIRE_PRAGUE and location and not any(w in location for w in ("prah", "prague")):
+                outside += 1
                 continue
             company = strip_html(j.get("company", ""))
             parts = [p for p in (company, strip_html(j.get("snippet", ""))) if p]
@@ -488,7 +612,8 @@ def fetch_jooble() -> list:
                 "source_name": "Jooble",
                 "trusted": True,
             })
-    STATS["jooble"] = f"{len(items)} nabídek" + (f", {errors} dotazů selhalo" if errors else "")
+    STATS["jooble"] = (f"{len(items)} nabídek (mimo Prahu vyřazeno: {outside})"
+                       + (f", {errors} dotazů selhalo" if errors else ""))
     print(f"Jooble: {STATS['jooble']}")
     return items
 
@@ -763,7 +888,7 @@ def build_html(jobs: list) -> str:
 
 def send_status(fetched: int, matched: int, dupes: int) -> None:
     if fetched == 0:
-        reason = (f"V e-mailových alertech za posledních {ALERT_DAYS} dní jsem nenašel žádné nabídky. "
+        reason = (f"V e-mailových alertech za posledních {ALERT_DAYS} dní ani na Práce.cz jsem nenašel žádné nabídky. "
                   "Zkontroluj, jestli ti v Gmailu chodí alerty z Jobs.cz a Práce.cz.")
     elif matched == 0:
         reason = f"Našel jsem {fetched} položek, ale filtry je všechny vyřadily."
@@ -775,7 +900,8 @@ def send_status(fetched: int, matched: int, dupes: int) -> None:
         f"Alert e-maily v Gmailu za posledních {ALERT_DAYS} dní: "
         + ("nepodařilo se zjistit" if mails is None else
            f"{mails}" + (f", nejnovější z {STATS['alert_newest']}" if STATS["alert_newest"] else ""))
-        + f". Jooble: {STATS['jooble'] or 'nepoužito'}."
+        + f". Práce.cz (web): {STATS['prace'] or 'nepoužito'}."
+        + f" Jooble: {STATS['jooble'] or 'nepoužito'}."
         + (f" {STATS['breakdown']}" if STATS["breakdown"] else "")
     )
     body = (
@@ -824,7 +950,16 @@ def main() -> int:
     items = []
     for url in FEEDS:
         items.extend(fetch_feed(url))
-    items.extend(fetch_alerts())
+
+    prace_items = fetch_prace()
+    # alerty z Práce.cz, které už přišly přímo z webu, se nepočítají podruhé
+    prace_titles = {title_key(i["title"]) for i in prace_items}
+    alerts = [
+        a for a in fetch_alerts()
+        if not (a.get("source_name") == "Práce.cz" and title_key(a["title"]) in prace_titles)
+    ]
+    items.extend(prace_items)
+    items.extend(alerts)
     items.extend(fetch_jooble())
     print(f"Staženo položek: {len(items)}")
 
@@ -838,6 +973,7 @@ def main() -> int:
     jobs, dupes = drop_seen(jobs, seen)
     count = lambda lst, src: sum(1 for j in lst if j.get("source") == src)
     STATS["breakdown"] = (
+        f"Z Práce.cz (web): nalezeno {count(matched_jobs, 'prace')}, nových {count(jobs, 'prace')}. "
         f"Z alertů: nalezeno {count(matched_jobs, 'alert')}, nových {count(jobs, 'alert')}. "
         f"Z Jooble: nalezeno {count(matched_jobs, 'jooble')}, nových {count(jobs, 'jooble')}."
     )
