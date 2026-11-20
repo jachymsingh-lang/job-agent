@@ -87,6 +87,7 @@ HIGH_RATE_PER_HOUR = 200
 # --- Deduplikace (aby ti nepřišel stejný inzerát dvakrát) ---
 SEEN_FILE = Path(__file__).resolve().parent / "seen.json"
 SEEN_KEEP_DAYS = 45          # po kolika dnech se inzerát z paměti zapomene
+LAST_SENT_FILE = Path(__file__).resolve().parent / "last_sent.txt"   # kdy naposledy odešel plánovaný e-mail
 
 # Parametry v odkazech, které jen sledují kliknutí a nemění samotný inzerát.
 TRACKING_PARAMS = {
@@ -413,6 +414,20 @@ def save_seen(seen: dict, sent_jobs: list) -> None:
         json.dumps(dict(sorted(seen.items())), ensure_ascii=False, indent=0) + "\n",
         encoding="utf-8",
     )
+
+
+def read_last_sent() -> str:
+    """Datum (ISO), kdy naposledy odešel plánovaný e-mail; prázdný řetězec, když ještě nikdy."""
+    try:
+        return LAST_SENT_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def mark_sent(day) -> None:
+    """Zapíše, že e-mail za daný den už odešel (day=None při ručním spuštění = nic se nezapisuje)."""
+    if day is not None:
+        LAST_SENT_FILE.write_text(day.isoformat() + "\n", encoding="utf-8")
 
 
 # ----------------------------- ALERTY Z GMAILU -----------------------------
@@ -937,10 +952,19 @@ def send_email(subject: str, html_body: str) -> None:
 
 
 def main() -> int:
+    # Plánovaný běh: pošli po 19:00 pražského času, ale jen jednou za den.
+    # Běh zpožděný po půlnoci (do 5:00) se počítá ještě k předchozímu dni.
     only_hour = os.environ.get("ONLY_AT_HOUR")
-    if only_hour and datetime.now(ZoneInfo("Europe/Prague")).hour != int(only_hour):
-        print("Mimo cílovou hodinu (pražský čas), končím.")
-        return 0
+    logical_day = None
+    if only_hour:
+        now = datetime.now(ZoneInfo("Europe/Prague"))
+        logical_day = now.date() - timedelta(days=1) if now.hour < 5 else now.date()
+        if 5 <= now.hour < int(only_hour):
+            print("Ještě není cílová hodina (pražský čas), končím.")
+            return 0
+        if read_last_sent() == logical_day.isoformat():
+            print("Dnešní e-mail už byl odeslán, končím.")
+            return 0
 
     missing = [v for v in ("SENDER_EMAIL", "SENDER_PASSWORD", "RECIPIENT_EMAIL", "RESEND_API_KEY") if not os.environ.get(v)]
     if missing:
@@ -985,6 +1009,7 @@ def main() -> int:
         if SEND_EMPTY_STATUS:
             send_status(len(items), matched, dupes)
             print("Odeslán stavový e-mail.")
+        mark_sent(logical_day)
         return 0
 
     top = sum(1 for j in jobs if j["recommended"])
@@ -993,6 +1018,7 @@ def main() -> int:
 
     # Zapisuje se až po úspěšném odeslání, aby se při chybě nic neztratilo.
     save_seen(seen, jobs)
+    mark_sent(logical_day)
     print(f"Uloženo do {SEEN_FILE.name}.")
     return 0
 
