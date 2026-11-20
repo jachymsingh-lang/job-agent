@@ -2,15 +2,14 @@ name: Job Agent
 
 on:
   schedule:
-    - cron: "5 17 * * *"   # 19:05 v létě (CEST)
-    - cron: "5 18 * * *"   # 19:05 v zimě (CET)
+    - cron: "5 17 * * *"   # 19:05 v létě / 18:05 v zimě (v zimě se sám přeskočí)
+    - cron: "5 18 * * *"   # 20:05 v létě / 19:05 v zimě
+    - cron: "5 19 * * *"   # záloha, kdyby se některý běh zpozdil nebo vynechal
   workflow_dispatch:
 
-# Potřeba, aby workflow mohl uložit seen.json zpět do repozitáře.
 permissions:
   contents: write
 
-# Dva běhy najednou by si přepsaly seen.json.
 concurrency:
   group: job-agent
   cancel-in-progress: false
@@ -36,19 +35,17 @@ jobs:
           JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
           ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '19' || '' }}
 
-      - name: Uložit seznam odeslaných inzerátů
+      - name: Uložit stav (seen.json, last_sent.txt)
         run: |
-          if [ -f seen.json ]; then
-            git config user.name "job-agent[bot]"
-            git config user.email "job-agent@users.noreply.github.com"
-            git add seen.json
-            if git diff --cached --quiet; then
-              echo "seen.json beze změn."
-            else
-              git commit -m "Aktualizace seen.json"
-              git pull --rebase
-              git push
-            fi
+          git config user.name "job-agent[bot]"
+          git config user.email "job-agent@users.noreply.github.com"
+          for f in seen.json last_sent.txt; do
+            [ -f "$f" ] && git add "$f"
+          done
+          if git diff --cached --quiet; then
+            echo "Beze změn."
           else
-            echo "seen.json zatím neexistuje (nebylo co poslat)."
+            git commit -m "Aktualizace stavu job agenta"
+            git pull --rebase
+            git push
           fi
