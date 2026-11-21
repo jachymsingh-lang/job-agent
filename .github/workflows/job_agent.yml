@@ -2,7 +2,9 @@ name: Job Agent
 
 on:
   schedule:
-    - cron: "13 15 * * *"   # TEST: 16:13 pražského času
+    - cron: "17 17 * * *"   # 19:17 v létě / 18:17 v zimě (v zimě se sám přeskočí)
+    - cron: "17 18 * * *"   # 20:17 v létě / 19:17 v zimě
+    - cron: "17 19 * * *"   # záloha pro případ zpoždění
   workflow_dispatch:
 
 permissions:
@@ -31,7 +33,7 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
-          ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '16' || '' }}
+          ONLY_AT_HOUR: ${{ github.event_name == 'schedule' && '19' || '' }}
 
       - name: Uložit stav (seen.json, last_sent.txt)
         run: |
