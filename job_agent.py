@@ -36,6 +36,11 @@ ROLE_KEYWORDS = [
     "it", "administrator", "správce", "webmaster", "administrativ", "junior",
     "podpora", "marketing", "e-shop", "eshop", "copywriter", "asistent",
     "home office", "homeoffice", "home-office", "remote", "z domova", "z domu",
+    # --- přidáno: další běžné pozice, které předtím propadaly ---
+    "recepc", "recepč", "receptionist", "assistant", "účetní", "ucetni", "brigád", "brigad",
+    "student", "zákaznick", "zakaznick", "customer service", "office",
+    "koordinátor", "koordinator", "kancelář", "kancelar", "operátor", "operator",
+    "stáž", "staz", "trainee", "intern",
 ]
 
 CONTRACT_KEYWORDS = [
@@ -53,6 +58,9 @@ EXCLUDE_PATTERNS = [
     r"číšn\w*", r"cisn\w*",
     r"řidič\w*", r"ridic\w*", r"kurýr\w*", r"kuryr\w*", r"kuchař\w*",
     r"(?<!\w)sestr\w*", r"mechanik\w*", r"sklad(?:ov|n)\w*",
+    # --- přidáno ---
+    r"[\u0400-\u04ff]",                       # nabídky s azbukou v názvu (ruština/ukrajinština)
+    r"rozvoz\w*", r"rozváž\w*", r"dýšk\w*",   # rozvoz, kurýrní práce s dýškama
 ]
 
 # Nabídky s těmito výrazy se řadí nahoru a dostanou označení "Doporučeno".
@@ -60,6 +68,9 @@ PRIORITY_KEYWORDS = [
     "web", "wordpress", "e-shop", "eshop", "webmaster", "it", "it podpora", "helpdesk",
     "administrativ", "asistent", "marketing", "copywrit", "social media", "sociální sítě",
     "home office", "homeoffice", "home-office", "remote", "z domova", "z domu", "vzdálen",
+    # --- přidáno ---
+    "recepc", "recepč", "receptionist", "assistant", "účetní", "ucetni", "zákaznick", "zakaznick",
+    "customer service", "junior", "office",
 ]
 
 # Skupiny pro motivační text.
@@ -78,6 +89,7 @@ PENALTY = 2                  # odečet za každé slovo z PENALTY_KEYWORDS
 PENALTY_KEYWORDS = ["plný úvazek", "plny uvazek", "full-time", "full time", "fulltime", "směnn", "smenn"]
 RECOMMEND_MIN_SCORE = 7      # od kolika bodů se nabídka označí jako "Doporučeno"
 MAX_FULL_CARDS = 15          # max. počet nabídek s plnou kartou a motivačním textem, zbytek je v seznamu
+MAX_PER_MAIL = 80            # max. počet nabídek v jednom e-mailu (zbytek přijde další den, Gmail ořezává dlouhé maily)
 SEND_EMPTY_STATUS = True     # když nejsou žádné nové nabídky, pošle krátký e-mail s vysvětlením proč
 MIN_CARD_SCORE = 3           # nabídky s nižším skóre jsou jen v krátkém seznamu "Další nabídky" (bez motivačního textu)
 
@@ -133,6 +145,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (JobAgent)"}
 JOOBLE_QUERIES = [
     "brigáda", "part-time", "DPP", "administrativa", "asistent",
     "e-shop", "marketing", "home office", "student", "copywriter",
+    # --- přidáno ---
+    "recepční", "účetní junior", "zákaznická podpora", "IT podpora",
+    "administrativní pracovník", "kancelářská práce", "junior", "stáž",
 ]
 JOOBLE_LOCATION = "Praha"
 JOOBLE_PER_QUERY = 20
@@ -149,10 +164,12 @@ PRACE_SEARCH_URL = (
     "&professionIds%5B%5D=201100289&professionIds%5B%5D=201100002&professionIds%5B%5D=201100193"
     "&professionIds%5B%5D=201100223&jobTypes%5B%5D=TEMPORARY_JOB&jobTypes%5B%5D=PART_TIME"
 )
-PRACE_PAGES = 5                      # kolik stránek výsledků se prochází (40 nabídek na stránku)
+PRACE_PAGES = 10                     # kolik stránek výsledků se prochází (40 nabídek na stránku)
 PRACE_PAUSE = 2                      # pauza mezi stránkami (sekundy)
 PRACE_LOCATION_WORDS = ("praha",)    # jen nabídky s tímto slovem v lokalitě; () = bez filtru
-PRACE_REQUIRE_KEYWORD = True         # název musí obsahovat aspoň jedno slovo z ROLE_KEYWORDS / PRIORITY_KEYWORDS
+# False = z webu se berou všechny nabídky z hledání (vyřadí je jen EXCLUDE_PATTERNS a lokalita).
+# Hledání výše je už zúžené na vaše obory a typ práce, takže další filtr názvu jen zbytečně zahazoval nabídky.
+PRACE_REQUIRE_KEYWORD = False
 PRACE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "cs,en;q=0.8",
@@ -367,15 +384,17 @@ def normalize_link(link: str) -> str:
 def title_key(title: str) -> str:
     t = unicodedata.normalize("NFKD", title.lower())
     t = "".join(c for c in t if not unicodedata.combining(c))
-    return "t:" + re.sub(r"[^a-z0-9]+", "", t)[:100]
+    # a-z, 0-9 a azbuka (aby název jen z azbuky nedal prázdný klíč)
+    return "t:" + re.sub(r"[^a-z0-9\u0400-\u04ff]+", "", t)[:100]
 
 
 def job_keys(job: dict) -> list:
     """Každý inzerát má dva 'otisky': odkaz a název. Stačí shoda v jednom z nich."""
     key = title_key(job["title"] + " " + job.get("company", ""))
+    keys = [] if key == "t:" else [key]          # prázdný klíč by blokoval všechny další nabídky
     if "jooble." in urlsplit(job["link"]).netloc.lower():
-        return [key]
-    return ["l:" + normalize_link(job["link"]), key]
+        return keys
+    return ["l:" + normalize_link(job["link"])] + keys
 
 
 def load_seen() -> dict:
@@ -389,7 +408,8 @@ def load_seen() -> dict:
         print(f"[WARN] seen.json se nepodařilo načíst, začínám s prázdným: {exc}", file=sys.stderr)
         return {}
     cutoff = (date.today() - timedelta(days=SEEN_KEEP_DAYS)).isoformat()
-    return {k: v for k, v in data.items() if isinstance(v, str) and v >= cutoff}
+    # klíč "t:" (prázdný název) z dřívějších verzí se zahodí, jinak by blokoval nabídky
+    return {k: v for k, v in data.items() if isinstance(v, str) and v >= cutoff and k != "t:"}
 
 
 def drop_seen(jobs: list, seen: dict):
@@ -575,7 +595,7 @@ def fetch_prace() -> list:
         STATS["prace"] = "nepodařilo se načíst (viz log)"
     else:
         STATS["prace"] = (f"{len(items)} nabídek z {total} (mimo Prahu: {skipped_loc}, "
-                          f"bez klíčového slova v názvu: {skipped_kw})")
+                          f"bez klíčového slova v názvu: {skipped_kw}), stran načteno: {pages_ok}")
     print(f"Práce.cz (web): {STATS['prace']}")
     return items
 
@@ -878,6 +898,14 @@ def build_html(jobs: list) -> str:
         )
 
     top_count = sum(1 for j in jobs if j["recommended"])
+
+    # Přehled podle zdrojů, aby bylo hned vidět, odkud nabídky přišly
+    by_source = {}
+    for j in jobs:
+        name = j.get("source_name") or j.get("source") or "jiný zdroj"
+        by_source[name] = by_source.get(name, 0) + 1
+    sources_line = " · ".join(f"{e(n)} {c}" for n, c in sorted(by_source.items(), key=lambda kv: -kv[1]))
+
     return f"""<!DOCTYPE html>
 <html lang="cs"><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
@@ -889,6 +917,7 @@ def build_html(jobs: list) -> str:
           <div style="font-size:14px;color:#94a3b8;margin-top:4px;">
             Nových nabídek: {len(jobs)} · doporučených: {top_count} · dalších v seznamu: {len(rest_jobs)} · {datetime.now().strftime('%d. %m. %Y')}
           </div>
+          <div style="font-size:12px;color:#64748b;margin-top:6px;">Zdroje: {sources_line}</div>
         </td></tr>
         <tr><td style="background:#e2e8f0;padding:16px;border-radius:0 0 14px 14px;">
           <table width="100%" cellpadding="0" cellspacing="0">
@@ -1011,6 +1040,11 @@ def main() -> int:
             print("Odeslán stavový e-mail.")
         mark_sent(logical_day)
         return 0
+
+    # Gmail ořezává příliš dlouhé maily. Co se nevejde, nezapíše se do seen.json a přijde příště.
+    if len(jobs) > MAX_PER_MAIL:
+        print(f"Nových nabídek je {len(jobs)}, do e-mailu jich půjde {MAX_PER_MAIL}, zbytek příště.")
+        jobs = jobs[:MAX_PER_MAIL]
 
     top = sum(1 for j in jobs if j["recommended"])
     send_email(f"Job Agent: {len(jobs)} nových nabídek ({top} doporučených)", build_html(jobs))
